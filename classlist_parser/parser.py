@@ -13,36 +13,120 @@ from tkinter import Tk, filedialog, messagebox
 import sys
 import os
 
+# CONFIGURATION SETTINGS FOR THIS TOOL.
+# Other departments or colleges can edit these values to customize behavior.
+# 🔧 TO CUSTOMIZE FOR YOUR DEPARTMENT:
+# - Change department_prefix to your subject code (e.g., "MTH", "WR").
+# - Change allowed_courses to your course numbers or set to None.
+# - Change email_domain if you're not at PCC.
+
+SETTINGS = {
+    # If you want to restrict parsing to a single subject/department
+    # (e.g., "GEO"), put the subject code here. Otherwise, use None.
+    "department_prefix": None,  # e.g., "GEO" or None for all subjects
+
+    # List of allowed course numbers as strings (e.g., ["170", "221"]).
+    # Set to None to accept all course numbers.
+    "allowed_courses": {"170", "221", "223", "240", "242", "244", "246",
+                        "248", "252", "254", "260", "265", "266", "267",
+                        "270", "280A"},
+
+    # Email domain used for institutional emails in the PDF.
+    # Other colleges can change this to their domain.
+    "email_domain": "@pcc.edu",
+
+    # Prefix for the output Excel filename (term will be appended if found).
+    "output_name_prefix": "GEO_Class_Lists",
+
+    # Subfolder where output files are written.
+    "output_subfolder": "Output Files",
+}
+
+
 _TERM_TEXT_RE = re.compile(r'\b(Spring|Summer|Fall|Winter)\s+(20\d{2})\b', re.I)
-_TERM_CODE_RE = re.compile(r'\b(20\d{2}0[1-4])\b')  # 202501..202504
+_TERM_CODE_RE = re.compile(r'\b(20\d{2}0[1-4])\b')  # e.g. 202501..202504
 
 
 def _term_from_code(code: str) -> str:
+    """
+    Convert a Banner-style term code (e.g. '202503') into a human-readable label.
+    Args:
+        code (str): The 6-digit Banner term code. The last digit encodes the season:
+                    1 = Winter, 2 = Spring, 3 = Summer, 4 = Fall.
+    Returns:
+        str: A string like 'Spring 2025' or an empty string if the code is not valid.
+    """
     season_map = {1: "Winter", 2: "Spring", 3: "Summer", 4: "Fall"}
+    # Example: '202503' -> last digit is 3 -> 'Summer', year is '2025'
     return f"{season_map.get(int(code[-1]), '')} {code[:4]}".strip()
 
+
 def _detect_term_from_pdf(pdf) -> str:
+    """
+    Detect the academic term from the first page of a Banner class list PDF.
+    This function checks for:
+      1. Explicit term text like 'Fall 2025', or
+      2. A numeric Banner term code like '202503', which it then converts.
+    Args:
+        pdf: An open pdfplumber PDF object.
+    Returns:
+        str: A human-readable term such as 'Fall 2025', or an empty string
+             if no term information can be found.
+    """
     try:
         header = (pdf.pages[0].extract_text() or "")
     except Exception:
         header = ""
+
+    # Try a direct match like 'Fall 2025'
     m = _TERM_TEXT_RE.search(header)
     if m:
         return f"{m.group(1).title()} {m.group(2)}"
+
+    # Otherwise, look for Banner codes like '202503'
     for m in _TERM_CODE_RE.finditer(header):
         guess = _term_from_code(m.group(0))
         if guess:
             return guess
-    return ""  # ok if empty
+
+    return ""  # okay if empty; we'll fall back to a generic filename
+
 
 def _safe_filename(s: str) -> str:
+    """
+    Clean a string so it is safe to use as a filename on most operating systems.
+    This:
+      * Replaces None with an empty string.
+      * Removes characters that are not letters, numbers, spaces, underscores, or hyphens.
+      * Collapses repeated whitespace into a single space.
+    Args:
+        s (str): The original string (e.g. a course title or term label).
+    Returns:
+        str: A simplified, filesystem-safe version of the string.
+    """
     s = (s or "").strip()
+    # Keep only letters, digits, spaces, underscores, and hyphens
     s = re.sub(r'[^A-Za-z0-9 _\-]', '', s)
+    # Collapse multiple spaces into one
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
-# List of allowed GEO courses, now including 242
-allowed_courses = {"170", "221", "223", "240", "242", "244", "246", "248", "252", "254", "260", "265", "266", "267", "270", "280A"}
+
+def app_dir() -> str:
+    """
+    Get the folder where this tool should write its output.
+    If the script is 'frozen' into an EXE (using something like PyInstaller),
+    this returns the folder where the EXE lives. Otherwise, it returns the
+    folder containing this .py file.
+    Returns:
+        str: Absolute path to the application's base directory.
+    """
+    if getattr(sys, "frozen", False):
+        # Running as a bundled EXE
+        return os.path.dirname(sys.executable)
+    # Running as a normal .py file
+    return os.path.dirname(os.path.abspath(__file__))
+
 
 records = []
 current_class = {}
@@ -70,7 +154,11 @@ try:
                 course_match = re.match(r"\s*(\d{5})\s+(\w+)\s+(\d+[A-Z]?)\s+(\d)\s+(.*)", line)
                 if course_match:
                     course_number = course_match.group(3)
-                    if course_number not in allowed_courses:
+
+                    # Apply optional course filter
+                    allowed = SETTINGS.get("allowed_courses")
+                    if allowed is not None and course_number not in allowed:
+                        # Skip this class if it's not in the allowed list
                         current_class = {}
                     else:
                         current_class = {
@@ -100,7 +188,7 @@ try:
                     email = ""
                     if idx + 1 < len(lines):
                         email_line = lines[idx + 1].strip()
-                        if "@pcc.edu" in email_line:
+                        if SETTINGS["email_domain"] in email_line:
                             email = email_line.split()[0]
 
                     records.append({
@@ -117,8 +205,10 @@ try:
                     idx += 1
 
     # build dynamic output name (now that pdf is closed)
-    stem = f"GEO_Class_Lists_{term_text}" if term_text else "GEO_Class_Lists"
+    prefix = SETTINGS["output_name_prefix"]
+    stem = f"{prefix}_{term_text}" if term_text else prefix
     out_name = _safe_filename(stem) + ".xlsx"
+
 
     def app_dir():
         # Folder of the EXE if frozen, else folder of this .py file
