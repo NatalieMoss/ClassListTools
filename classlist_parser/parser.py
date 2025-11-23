@@ -5,13 +5,15 @@ A tool for parsing Banner SIS PDF class lists into clean spreadsheets.
 Part of the PCC Classlist Party Pack.
 """
 
-import pdfplumber
+import os
 import re
-import pandas as pd
+import sys
 from collections import defaultdict
 from tkinter import Tk, filedialog, messagebox
-import sys
-import os
+import json
+import pandas as pd
+import pdfplumber
+from settings import SETTINGS
 
 # CONFIGURATION SETTINGS FOR THIS TOOL.
 # Other departments or colleges can edit these values to customize behavior.
@@ -20,7 +22,7 @@ import os
 # - Change allowed_courses to your course numbers or set to None.
 # - Change email_domain if you're not at PCC.
 
-SETTINGS = {
+DEFAULT_SETTINGS = {
     # If you want to restrict parsing to a single subject/department
     # (e.g., "GEO"), put the subject code here. Otherwise, use None.
     "department_prefix": None,  # e.g., "GEO" or None for all subjects
@@ -42,10 +44,57 @@ SETTINGS = {
     "output_subfolder": "Output Files",
 }
 
+def load_settings() -> dict:
+    """
+    Load user settings from settings.json if it exists, and merge them
+    over the DEFAULT_SETTINGS. This lets non-programmers customize the
+    tool without editing the Python code.
+
+    Returns:
+        dict: The effective settings dictionary.
+    """
+    settings = DEFAULT_SETTINGS.copy()
+    config_path = os.path.join(app_dir(), "settings.json")
+
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                user_settings = json.load(f)
+
+            # Merge user settings onto defaults
+            if isinstance(user_settings, dict):
+                settings.update(user_settings)
+            else:
+                messagebox.showerror(
+                    "Settings error",
+                    "settings.json is not a JSON object. Using default settings instead."
+                )
+    except Exception as e:
+        # If anything goes wrong, fall back to defaults but let the user know
+        messagebox.showerror(
+            "Settings error",
+            f"Could not load settings.json.\nUsing default settings.\n\nDetails: {e}"
+        )
+
+    return settings
 
 _TERM_TEXT_RE = re.compile(r'\b(Spring|Summer|Fall|Winter)\s+(20\d{2})\b', re.I)
 _TERM_CODE_RE = re.compile(r'\b(20\d{2}0[1-4])\b')  # e.g. 202501..202504
 
+def app_dir() -> str:
+    """
+    Get the folder where this tool should write its output.
+    If the script is 'frozen' into an EXE (using something like PyInstaller),
+    this returns the folder where the EXE lives. Otherwise, it returns the
+    folder containing this .py file.
+    Returns:
+        str: Absolute path to the application's base directory.
+    """
+    if getattr(sys, "frozen", False):
+        # Running as a bundled EXE
+        return os.path.dirname(sys.executable)
+    # Running as a normal .py file
+    return os.path.dirname(os.path.abspath(__file__))
 
 def _term_from_code(code: str) -> str:
     """
@@ -59,6 +108,56 @@ def _term_from_code(code: str) -> str:
     season_map = {1: "Winter", 2: "Spring", 3: "Summer", 4: "Fall"}
     # Example: '202503' -> last digit is 3 -> 'Summer', year is '2025'
     return f"{season_map.get(int(code[-1]), '')} {code[:4]}".strip()
+
+def load_settings() -> dict:
+    """
+    Load user settings from settings.json if it exists, and merge them
+    over the default SETTINGS from settings.py.
+
+    This lets non-programmers tweak behavior without editing Python code.
+
+    Rules:
+      - If settings.json doesn't exist, we just use SETTINGS.
+      - If it exists but is invalid, we show a warning and fall back to SETTINGS.
+      - If it supplies allowed_courses as a list, we convert it to a set.
+    """
+    # Start with the defaults from settings.py
+    settings = dict(SETTINGS)
+
+    config_path = os.path.join(app_dir(), "settings.json")
+
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                user_settings = json.load(f)
+
+            if isinstance(user_settings, dict):
+                # If allowed_courses is supplied as a list in JSON,
+                # convert it to a set to match our internal usage.
+                if "allowed_courses" in user_settings:
+                    ac = user_settings["allowed_courses"]
+                    if ac is None:
+                        # Explicitly disable course filtering
+                        user_settings["allowed_courses"] = None
+                    elif isinstance(ac, list):
+                        user_settings["allowed_courses"] = set(ac)
+
+                settings.update(user_settings)
+            else:
+                messagebox.showerror(
+                    "Settings error",
+                    "settings.json must contain a JSON object at the top level.\n"
+                    "Using default settings instead."
+                )
+    except Exception as e:
+        # If anything goes wrong, fall back to defaults but let the user know.
+        messagebox.showerror(
+            "Settings error",
+            f"Could not load settings.json.\n"
+            f"Using default settings instead.\n\nDetails: {e}"
+        )
+
+    return settings
 
 
 def _detect_term_from_pdf(pdf) -> str:
@@ -111,52 +210,46 @@ def _safe_filename(s: str) -> str:
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
-
-def app_dir() -> str:
+def main() -> None:
     """
-    Get the folder where this tool should write its output.
-    If the script is 'frozen' into an EXE (using something like PyInstaller),
-    this returns the folder where the EXE lives. Otherwise, it returns the
-    folder containing this .py file.
-    Returns:
-        str: Absolute path to the application's base directory.
+    Main entry point for the Classlist Party Starter.
+
+    Opens a file dialog to select a Banner class list PDF (landscape format),
+    parses the contents into student records, and writes an Excel workbook
+    with a Combined sheet and one sheet per class/CRN.
     """
-    if getattr(sys, "frozen", False):
-        # Running as a bundled EXE
-        return os.path.dirname(sys.executable)
-    # Running as a normal .py file
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-records = []
-current_class = {}
-
-try:
+    settings = load_settings()
+    # Hide the root Tk window and show an "Open file" dialog instead
     root = Tk()
     root.withdraw()
-    pdf_file = filedialog.askopenfilename(title="Select your class list PDF", filetypes=[("PDF files", "*.pdf")])
+
+    pdf_file = filedialog.askopenfilename(
+        title="Select your class list PDF",
+        filetypes=[("PDF files", "*.pdf")]
+    )
     if not pdf_file:
-        sys.exit()
+        # User cancelled; just exit quietly
+        return
 
     records = []
     current_class = {}
 
     with pdfplumber.open(pdf_file) as pdf:
-        # detect the term while the file is open
-        term_text = _detect_term_from_pdf(pdf)   # "Fall 2025" / "Summer 2025" / ""
+        # Detect the term while the file is open
+        term_text = _detect_term_from_pdf(pdf)   # e.g. "Fall 2025" or ""
 
         for page in pdf.pages:
             text = (page.extract_text() or "")
             lines = text.split("\n")
 
-            # header line: capture CRN, subject, course number, section, name
+            # --- Class header parsing: capture CRN, subject, course number, section, name ---
             for line in lines:
                 course_match = re.match(r"\s*(\d{5})\s+(\w+)\s+(\d+[A-Z]?)\s+(\d)\s+(.*)", line)
                 if course_match:
                     course_number = course_match.group(3)
 
-                    # Apply optional course filter
-                    allowed = SETTINGS.get("allowed_courses")
+                    # Optional course filter from settings
+                    allowed = settings.get("allowed_courses")
                     if allowed is not None and course_number not in allowed:
                         # Skip this class if it's not in the allowed list
                         current_class = {}
@@ -169,13 +262,14 @@ try:
                             "Course Name": course_match.group(5).strip(),
                         }
 
-            # student rows
+            # --- Student rows ---
             idx = 0
             while idx < len(lines):
                 line = lines[idx]
                 gnum_match = re.search(r"(G\d{8})", line)
                 if gnum_match and current_class:
                     try:
+                        # Extract "Last, First" before the G-number
                         name_part = line.split(gnum_match.group(1))[0]
                         last_first = name_part.split(None, 1)[1].split(',')
                         last_name = last_first[0].strip()
@@ -185,10 +279,11 @@ try:
 
                     g_number = gnum_match.group(1)
 
+                    # Look for institutional email on the next line
                     email = ""
                     if idx + 1 < len(lines):
                         email_line = lines[idx + 1].strip()
-                        if SETTINGS["email_domain"] in email_line:
+                        if settings["email_domain"] in email_line:
                             email = email_line.split()[0]
 
                     records.append({
@@ -200,45 +295,48 @@ try:
                         "Class": f"{current_class.get('Subject')} {current_class.get('Course Number')}",
                         "CRN": current_class.get("CRN"),
                     })
+                    # Skip to the line after the email line
                     idx += 2
                 else:
                     idx += 1
 
-    # build dynamic output name (now that pdf is closed)
-    prefix = SETTINGS["output_name_prefix"]
+    # --- Build dynamic output name (now that pdf is closed) ---
+    prefix = settings["output_name_prefix"]
     stem = f"{prefix}_{term_text}" if term_text else prefix
     out_name = _safe_filename(stem) + ".xlsx"
 
-
-    def app_dir():
-        # Folder of the EXE if frozen, else folder of this .py file
-        return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
-            else os.path.dirname(os.path.abspath(__file__))
-
-
-    # Always write to: <tool folder>\Output Files
-    output_dir = os.path.join(app_dir(), "Output Files")
+    # Always write to: <tool folder>\<output_subfolder>
+    output_dir = os.path.join(app_dir(), settings["output_subfolder"])
     os.makedirs(output_dir, exist_ok=True)
 
-    output_path = os.path.join(output_dir, out_name)  # out_name already "GEO_Class_Lists_<term>.xlsx"
+    output_path = os.path.join(output_dir, out_name)
 
-    # output_dir = os.path.dirname(pdf_file)  # or wherever you prefer
-    # output_path = os.path.join(output_dir, out_name)
-
-    # group and write
+    # Group records by Class+CRN for per-class sheets
     grouped = defaultdict(list)
     for rec in records:
         grouped[f"{rec['Class']}_{rec['CRN']}"].append(rec)
 
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        pd.DataFrame(records).to_excel(writer, sheet_name="Combined", index=False)
-        for key, recs in grouped.items():
-            sheet_name = key[:31]
-            pd.DataFrame(recs).to_excel(writer, sheet_name=sheet_name, index=False)
+    # Write the Excel file
+    try:
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            pd.DataFrame(records).to_excel(writer, sheet_name="Combined", index=False)
 
-    messagebox.showinfo("Done", f"Created:\n{output_path}")
+            for key, recs in grouped.items():
+                sheet_name = key[:31]  # Excel sheet name limit
+                pd.DataFrame(recs).to_excel(writer, sheet_name=sheet_name, index=False)
 
-except Exception as e:
-    messagebox.showerror("Error", f"There was an error: {e}")
+        messagebox.showinfo("Done", f"Created:\n{output_path}")
+
+    except PermissionError:
+        messagebox.showerror(
+            "Permission Error",
+            "I couldn't write the Excel file because it appears to be open in another program.\n\n"
+            "Please close the file in Excel (or any app that may be locking it) and run the tool again."
+        )
 
 
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        messagebox.showerror("Error", f"There was an unexpected error:\n{e}")
